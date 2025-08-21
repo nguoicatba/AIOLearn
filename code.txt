@@ -1,0 +1,486 @@
+# ila_main.py
+from __future__ import annotations
+from collections import defaultdict, Counter
+from itertools import combinations
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Any, Optional
+import sys
+import pandas as pd
+
+# ================== ENCODING / DATA ==================
+
+
+@dataclass
+class EncodedData:
+    ids: List[str]                  # định danh từng dòng (từ cột đầu)
+    X: List[List[int]]              # ma trận thuộc tính (không gồm class)
+    y: List[int]                    # cột class đã mã-hoá
+    headers: List[str]              # tên cột thuộc tính 0..n_attr-1
+    class_name: str                 # tên cột class
+    inv_maps: List[Dict[int, Any]]  # map ngược cho từng thuộc tính
+    inv_map_y: Dict[int, Any]       # map ngược cho class
+
+
+def encode_series(s: pd.Series) -> Tuple[List[int], Dict[int, Any]]:
+    s2 = s.fillna("∅").astype(str)
+    uniques = {v: i for i, v in enumerate(pd.unique(s2))}
+    inv = {i: v for v, i in uniques.items()}
+    return [uniques[v] for v in s2], inv
+
+
+def preprocessing_data(file_path: str) -> EncodedData:
+    df = pd.read_excel(file_path)
+    assert df.shape[1] >= 3, "Cần >= 3 cột (ID + >=1 thuộc tính + 1 class)."
+
+    ids = df.iloc[:, 0].astype(str).fillna("").tolist()
+    df2 = df.iloc[:, 1:]  # bỏ cột ID
+
+    *attr_cols, class_col = df2.columns.tolist()
+
+    X_enc_cols: List[List[int]] = []
+    inv_maps: List[Dict[int, Any]] = []
+    for col in attr_cols:
+        enc, inv = encode_series(df2[col])
+        inv_maps.append(inv)
+        X_enc_cols.append(enc)
+
+    X = list(map(list, zip(*X_enc_cols))
+             ) if X_enc_cols else [[] for _ in range(len(df2))]
+
+    y_enc, inv_y = encode_series(df2[class_col])
+
+    return EncodedData(
+        ids=ids,
+        X=X,
+        y=y_enc,
+        headers=attr_cols,
+        class_name=class_col,
+        inv_maps=inv_maps,
+        inv_map_y=inv_y
+    )
+
+# ================== ILA CORE ==================
+
+
+def generate_combinations(n: int, k: int):
+    if k < 1 or k > n:
+        return []
+    return list(combinations(range(n), k))
+
+
+def ILA(encoded: EncodedData) -> List[List[int]]:
+    X, y = encoded.X, encoded.y
+    n_attr = len(encoded.headers)
+    rules: List[List[int]] = []
+
+    # Chia bảng con theo class
+    sub_idx: Dict[int, List[int]] = defaultdict(list)
+    for i, label in enumerate(y):
+        sub_idx[label].append(i)
+
+    def key_of(row_idx: int, comb: Tuple[int, ...]) -> Tuple[Any, ...]:
+        return tuple(X[row_idx][a] for a in comb)
+
+    # Xử lý từng bảng con
+    for label, idxs in sub_idx.items():
+        print(f"\n=== BẢNG CON CHO CLASS: {encoded.inv_map_y[label]} ===")
+        for new_id, row_idx in enumerate(idxs, start=1):
+            attr_vals = [encoded.inv_maps[a][X[row_idx][a]] for a in range(n_attr)]
+            print(f"  {new_id:2d}. {attr_vals} → {encoded.inv_map_y[y[row_idx]]}")
+
+        mask = [False] * len(idxs)  # đánh dấu
+        j = 1
+        while not all(mask):
+            print(f"\n-- Xét j = {j} thuộc tính --")
+            if j > n_attr:
+                print("  Không còn tổ hợp nào thoả mãn, dừng.")
+                break
+
+            best_comb = None
+            best_count = 0
+            best_rows_local = []
+
+            # Liệt kê các tổ hợp
+            for comb in generate_combinations(n_attr, j):
+                comb_names = [encoded.headers[a] for a in comb]
+                print(f"  * Tổ hợp {comb_names}:")
+                freq: Dict[Tuple[Any, ...], List[int]] = defaultdict(list)
+
+                # Đếm xuất hiện trong bảng con
+                for local_i, row_idx in enumerate(idxs):
+                    if mask[local_i]:
+                        continue
+                    freq[key_of(row_idx, comb)].append(local_i)
+
+                # Xây set khóa bảng khác
+                other_keys = set()
+                for other_label, other_idxs in sub_idx.items():
+                    if other_label == label:
+                        continue
+                    for row_idx in other_idxs:
+                        other_keys.add(key_of(row_idx, comb))
+
+                # In kết quả đếm
+                for val_tuple, local_ids in freq.items():
+                    val_names = [encoded.inv_maps[a][v] for a, v in zip(comb, val_tuple)]
+                    count = len(local_ids)
+                    appear_else = val_tuple in other_keys
+                    print(f"     Giá trị {val_names} xuất hiện {count} lần"
+                          f"{' (có ở bảng khác)' if appear_else else ''}")
+
+                    if not appear_else and count > best_count:
+                        best_count = count
+                        best_comb = comb
+                        best_rows_local = local_ids
+
+            if best_count == 0:
+                j += 1
+                continue
+
+            # Tạo luật
+            rule = [-1] * (n_attr + 1)
+            first_row_idx = idxs[best_rows_local[0]]
+            for a in best_comb:
+                rule[a] = X[first_row_idx][a]
+            rule[-1] = label
+            rules.append(rule)
+
+            # Đánh dấu dòng bị loại
+            removed_ids = []
+            for local_i in best_rows_local:
+                if not mask[local_i]:
+                    mask[local_i] = True
+                    removed_ids.append(encoded.ids[idxs[local_i]])
+
+            comb_names = [encoded.headers[a] for a in best_comb]
+            val_names = [encoded.inv_maps[a][X[first_row_idx][a]] for a in best_comb]
+            print(f"  → Chọn {comb_names} = {val_names} → Luật: {format_rule(rule, encoded)}")
+            print(f"    Đánh dấu loại bỏ các dòng: {removed_ids}")
+
+    return rules
+
+
+
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python ila_main.py <excel_file_path>")
+        sys.exit(1)
+
+    file_path = sys.argv[1]
+    enc = preprocessing_data(file_path)
+
+    # Sinh luật
+    rules = ILA(enc)
+
+    # In luật cuối cùng
+    print("\n== Tập luật ILA cuối cùng ==")
+    for i, r in enumerate(rules, 1):
+        print(f"Rule {i}: {format_rule(r, enc)}")
+
+
+# ================== PRINTING / CLASSIFY ==================
+
+
+def format_rule(rule: List[int], enc: EncodedData) -> str:
+    n_attr = len(enc.headers)
+    parts = []
+    for i in range(n_attr):
+        v = rule[i]
+        if v != -1:
+            parts.append(f"{enc.headers[i]} = {enc.inv_maps[i][v]}")
+    cls = enc.inv_map_y[rule[-1]]
+    cond = " AND ".join(parts) if parts else "TRUE"
+    return f"IF {cond} THEN {enc.class_name} = {cls}"
+
+
+def row_matches_rule(row_vals: List[int], rule: List[int]) -> bool:
+    for i, v in enumerate(rule[:-1]):
+        if v == -1:
+            continue
+        if row_vals[i] != v:
+            return False
+    return True
+
+
+def classify_row(row_vals: List[int], rules: List[List[int]], default_class: Optional[int]) -> Tuple[int, Optional[int]]:
+    # trả về (class, index_rule | None)
+    for idx, rule in enumerate(rules):
+        if row_matches_rule(row_vals, rule):
+            return rule[-1], idx  # first-match
+    return (default_class if default_class is not None else -1), None
+
+# ================== MAIN ==================
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python ila_main.py <excel_file_path>")
+        sys.exit(1)
+
+    file_path = sys.argv[1]
+    enc = preprocessing_data(file_path)
+
+    # Sinh luật
+    rules = ILA(enc)
+
+    # In luật
+    print("\n== Tập luật ILA ==")
+    for i, r in enumerate(rules, 1):
+        print(f"Rule {i}: {format_rule(r, enc)}")
+
+    # Class đa số để fallback
+    majority_label: Optional[int] = None
+    if enc.y:
+        cnt = Counter(enc.y)
+        majority_label = cnt.most_common(1)[0][0]
+
+
+
+
+if __name__ == "__main__":
+    main()
+# ila_main.py
+from __future__ import annotations
+from collections import defaultdict, Counter
+from itertools import combinations
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Any, Optional
+import sys
+import pandas as pd
+
+# ================== ENCODING / DATA ==================
+
+
+@dataclass
+class EncodedData:
+    ids: List[str]                  # định danh từng dòng (từ cột đầu)
+    X: List[List[int]]              # ma trận thuộc tính (không gồm class)
+    y: List[int]                    # cột class đã mã-hoá
+    headers: List[str]              # tên cột thuộc tính 0..n_attr-1
+    class_name: str                 # tên cột class
+    inv_maps: List[Dict[int, Any]]  # map ngược cho từng thuộc tính
+    inv_map_y: Dict[int, Any]       # map ngược cho class
+
+
+def encode_series(s: pd.Series) -> Tuple[List[int], Dict[int, Any]]:
+    s2 = s.fillna("∅").astype(str)
+    uniques = {v: i for i, v in enumerate(pd.unique(s2))}
+    inv = {i: v for v, i in uniques.items()}
+    return [uniques[v] for v in s2], inv
+
+
+def preprocessing_data(file_path: str) -> EncodedData:
+    df = pd.read_excel(file_path)
+    assert df.shape[1] >= 3, "Cần >= 3 cột (ID + >=1 thuộc tính + 1 class)."
+
+    ids = df.iloc[:, 0].astype(str).fillna("").tolist()
+    df2 = df.iloc[:, 1:]  # bỏ cột ID
+
+    *attr_cols, class_col = df2.columns.tolist()
+
+    X_enc_cols: List[List[int]] = []
+    inv_maps: List[Dict[int, Any]] = []
+    for col in attr_cols:
+        enc, inv = encode_series(df2[col])
+        inv_maps.append(inv)
+        X_enc_cols.append(enc)
+
+    X = list(map(list, zip(*X_enc_cols))
+             ) if X_enc_cols else [[] for _ in range(len(df2))]
+
+    y_enc, inv_y = encode_series(df2[class_col])
+
+    return EncodedData(
+        ids=ids,
+        X=X,
+        y=y_enc,
+        headers=attr_cols,
+        class_name=class_col,
+        inv_maps=inv_maps,
+        inv_map_y=inv_y
+    )
+
+# ================== ILA CORE ==================
+
+
+def generate_combinations(n: int, k: int):
+    if k < 1 or k > n:
+        return []
+    return list(combinations(range(n), k))
+
+
+def ILA(encoded: EncodedData) -> List[List[int]]:
+    X, y = encoded.X, encoded.y
+    n_attr = len(encoded.headers)
+    rules: List[List[int]] = []
+
+    # Chia bảng con theo class
+    sub_idx: Dict[int, List[int]] = defaultdict(list)
+    for i, label in enumerate(y):
+        sub_idx[label].append(i)
+
+    def key_of(row_idx: int, comb: Tuple[int, ...]) -> Tuple[Any, ...]:
+        return tuple(X[row_idx][a] for a in comb)
+
+    # Xử lý từng bảng con
+    for label, idxs in sub_idx.items():
+        print(f"\n=== BẢNG CON CHO CLASS: {encoded.inv_map_y[label]} ===")
+        for new_id, row_idx in enumerate(idxs, start=1):
+            attr_vals = [encoded.inv_maps[a][X[row_idx][a]] for a in range(n_attr)]
+            print(f"  {new_id:2d}. {attr_vals} → {encoded.inv_map_y[y[row_idx]]}")
+
+        mask = [False] * len(idxs)  # đánh dấu
+        j = 1
+        while not all(mask):
+            print(f"\n-- Xét j = {j} thuộc tính --")
+            if j > n_attr:
+                print("  Không còn tổ hợp nào thoả mãn, dừng.")
+                break
+
+            best_comb = None
+            best_count = 0
+            best_rows_local = []
+
+            # Liệt kê các tổ hợp
+            for comb in generate_combinations(n_attr, j):
+                comb_names = [encoded.headers[a] for a in comb]
+                print(f"  * Tổ hợp {comb_names}:")
+                freq: Dict[Tuple[Any, ...], List[int]] = defaultdict(list)
+
+                # Đếm xuất hiện trong bảng con
+                for local_i, row_idx in enumerate(idxs):
+                    if mask[local_i]:
+                        continue
+                    freq[key_of(row_idx, comb)].append(local_i)
+
+                # Xây set khóa bảng khác
+                other_keys = set()
+                for other_label, other_idxs in sub_idx.items():
+                    if other_label == label:
+                        continue
+                    for row_idx in other_idxs:
+                        other_keys.add(key_of(row_idx, comb))
+
+                # In kết quả đếm
+                for val_tuple, local_ids in freq.items():
+                    val_names = [encoded.inv_maps[a][v] for a, v in zip(comb, val_tuple)]
+                    count = len(local_ids)
+                    appear_else = val_tuple in other_keys
+                    print(f"     Giá trị {val_names} xuất hiện {count} lần"
+                          f"{' (có ở bảng khác)' if appear_else else ''}")
+
+                    if not appear_else and count > best_count:
+                        best_count = count
+                        best_comb = comb
+                        best_rows_local = local_ids
+
+            if best_count == 0:
+                j += 1
+                continue
+
+            # Tạo luật
+            rule = [-1] * (n_attr + 1)
+            first_row_idx = idxs[best_rows_local[0]]
+            for a in best_comb:
+                rule[a] = X[first_row_idx][a]
+            rule[-1] = label
+            rules.append(rule)
+
+            # Đánh dấu dòng bị loại
+            removed_ids = []
+            for local_i in best_rows_local:
+                if not mask[local_i]:
+                    mask[local_i] = True
+                    removed_ids.append(encoded.ids[idxs[local_i]])
+
+            comb_names = [encoded.headers[a] for a in best_comb]
+            val_names = [encoded.inv_maps[a][X[first_row_idx][a]] for a in best_comb]
+            print(f"  → Chọn {comb_names} = {val_names} → Luật: {format_rule(rule, encoded)}")
+            print(f"    Đánh dấu loại bỏ các dòng: {removed_ids}")
+
+    return rules
+
+
+
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python ila_main.py <excel_file_path>")
+        sys.exit(1)
+
+    file_path = sys.argv[1]
+    enc = preprocessing_data(file_path)
+
+    # Sinh luật
+    rules = ILA(enc)
+
+    # In luật cuối cùng
+    print("\n== Tập luật ILA cuối cùng ==")
+    for i, r in enumerate(rules, 1):
+        print(f"Rule {i}: {format_rule(r, enc)}")
+
+
+# ================== PRINTING / CLASSIFY ==================
+
+
+def format_rule(rule: List[int], enc: EncodedData) -> str:
+    n_attr = len(enc.headers)
+    parts = []
+    for i in range(n_attr):
+        v = rule[i]
+        if v != -1:
+            parts.append(f"{enc.headers[i]} = {enc.inv_maps[i][v]}")
+    cls = enc.inv_map_y[rule[-1]]
+    cond = " AND ".join(parts) if parts else "TRUE"
+    return f"IF {cond} THEN {enc.class_name} = {cls}"
+
+
+def row_matches_rule(row_vals: List[int], rule: List[int]) -> bool:
+    for i, v in enumerate(rule[:-1]):
+        if v == -1:
+            continue
+        if row_vals[i] != v:
+            return False
+    return True
+
+
+def classify_row(row_vals: List[int], rules: List[List[int]], default_class: Optional[int]) -> Tuple[int, Optional[int]]:
+    # trả về (class, index_rule | None)
+    for idx, rule in enumerate(rules):
+        if row_matches_rule(row_vals, rule):
+            return rule[-1], idx  # first-match
+    return (default_class if default_class is not None else -1), None
+
+# ================== MAIN ==================
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python ila_main.py <excel_file_path>")
+        sys.exit(1)
+
+    file_path = sys.argv[1]
+    enc = preprocessing_data(file_path)
+
+    # Sinh luật
+    rules = ILA(enc)
+
+    # In luật
+    print("\n== Tập luật ILA ==")
+    for i, r in enumerate(rules, 1):
+        print(f"Rule {i}: {format_rule(r, enc)}")
+
+    # Class đa số để fallback
+    majority_label: Optional[int] = None
+    if enc.y:
+        cnt = Counter(enc.y)
+        majority_label = cnt.most_common(1)[0][0]
+
+
+
+
+if __name__ == "__main__":
+    main()
